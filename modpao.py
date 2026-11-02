@@ -176,7 +176,7 @@ def split_flags(tokens):
         t = tokens[i]
         if t in ("-a", "brute", "--flood", "-y", "--nmap", "--add", "--multi", "-F", "-v", "--fc23", "-T", "--no-crc", "--deep"):
             flags[t.lstrip("-")] = True
-        elif t in ("-d", "-u", "-sl", "-s", "-t", "-D", "-p"):
+        elif t in ("-d", "-u", "-sl", "-s", "-t", "-D", "-p", "--count"):
             key = t.lstrip("-")
             flags[key] = tokens[i + 1] if i + 1 < len(tokens) else ""
             i += 1
@@ -428,7 +428,7 @@ def _read_dispatch(ot, typ, addrs, dmode, multi=False, threads=1, filt=False):
 
 def m_enum(flags, args):
     if not args:
-        info("ENUM: read TYPE ADDR | scan TYPE RANGE | scan -u RANGE   (TYPE = c|di|h|ir)")
+        info("ENUM: read TYPE ADDR | scan TYPE RANGE | scan -u RANGE | flood TYPE ADDR   (TYPE = c|di|h|ir)")
         return
     uid = uid_from(flags); dmode = flags.get("d", sess()["decode"]); sub = args[0]
     with conn(uid) as ot:
@@ -462,8 +462,163 @@ def m_enum(flags, args):
                 print(f"  {name:16}{a:>6}  {C.DIM}{tag_for(a, what):12}{C.RS}{C.GR}{val}{C.RS}")
                 found += 1
             ok(f"{found} non-zero")
+        elif sub == "flood":
+            m_flood_read(flags, args[1:])
         else:
-            err("ENUM: read | scan")
+            err("ENUM: read | scan | flood")
+
+
+# --------------------------------------------------------- FLOOD READ --------
+def _flood_fmt_last(block, typ, dmode):
+    """pretty-print the most recent value read (for the live stat line)."""
+    if block is None:
+        return f"{C.RD}<err>{C.RS}"
+    if typ in ("h", "ir") and dmode and dmode not in ("int", None):
+        try:
+            return str(decode(block, dmode))
+        except Exception:
+            pass
+    return str(block[0] if len(block) == 1 else list(block))
+
+
+def _flood_scalar(block, typ, dmode):
+    """pull one numeric value out of a read, for value-range (min/max) tracking."""
+    if not block:
+        return None
+    if typ in ("h", "ir") and dmode == "f32":
+        try:
+            d = decode(block, "f32")
+            return d[0] if d else None
+        except Exception:
+            return None
+    v = block[0]
+    if isinstance(v, bool):
+        return int(v)
+    return v if isinstance(v, (int, float)) else None
+
+
+def _flood_read_line(stats, el, typ, dmode):
+    el = el or 1e-9
+    last = _flood_fmt_last(stats["last"], typ, dmode)
+    avg_ms = (stats["lat_sum"] / stats["lat_n"] * 1000.0) if stats["lat_n"] else 0.0
+    print(f"  {C.DIM}reads={stats['reads']:<7} err={stats['err']:<5} "
+          f"rate={stats['reads']/el:7.1f}/s  lat~{avg_ms:5.2f}ms  last={last}{C.RS}")
+
+
+def m_flood_read(flags, args):
+    """Read the SAME address(es) over and over as fast as possible (throughput /
+    stress / liveness test), printing a live rate + error counter.
+    Different from MONITOR (paced table poll) and WATCH (delta alert): no pacing,
+    it hammers reads at max speed. The read-side twin of persist --flood."""
+    if len(args) < 2:
+        info("FLOOD read - hammer the same address(es) at max speed, live rate/latency stats")
+        print("    flood TYPE ADDR [SECONDS]    TYPE = c|di|h|ir   (ADDR = 5 or range 1-10)")
+        print(f"  {C.DIM}how long: SECONDS as a word, or -D sec  (default 10s, 0 = until Ctrl-C)")
+        print("  flags: --count N (stop after N reads)  -t N (threads)  -d f32|ascii|hex  -u uid")
+        print("  reports: reads/s, error %, latency min/avg/max (ms), value range seen")
+        print(f"  ex: flood h 1027 | flood h 1027 30 | flood h 1024-1030 -t 8 | flood h 40050 -d f32{C.RS}")
+        return
+    typ = args[0]
+    if typ not in TYPE_NAME:
+        err("TYPE must be c (Coil) | di (DiscreteInput) | h (HoldingRegister) | ir (InputRegister)")
+        return
+    addrs = parse_addrs(args[1])
+    if not addrs:
+        err("no address"); return
+
+    # how long: -D flag wins, else a positional SECONDS, else default 10s
+    if "D" in flags:
+        dur = float(flags["D"])
+    elif len(args) > 2:
+        try:
+            dur = float(args[2])
+        except ValueError:
+            err(f"SECONDS must be a number (got '{args[2]}') - e.g. flood {typ} {args[1]} 30"); return
+    else:
+        dur = 10.0
+    count = int(flags["count"]) if "count" in flags else 0
+    threads = max(1, int(flags.get("t", 1)))
+    uid = uid_from(flags)
+    dmode = flags.get("d", sess()["decode"])
+    n = len(addrs); blk0 = addrs[0]
+    name = TYPE_NAME[typ]
+
+    span = f"{addrs[0]}" + (f"-{addrs[-1]}" if n > 1 else "")
+    how = f"count={count}" if count else (f"{dur:g}s" if dur else "until Ctrl-C")
+    info(f"FLOOD read {name} {span}  {threads} thread(s)  {how}  (max rate -> "
+         f"{sess()['ip'] or '?'}:{sess()['port']})")
+    print(f"  {C.DIM}Ctrl-C to stop early{C.RS}")
+
+    stop = threading.Event()
+    stats = {"reads": 0, "err": 0, "last": None,
+             "lat_sum": 0.0, "lat_n": 0, "lat_min": float("inf"), "lat_max": 0.0,
+             "vmin": None, "vmax": None}
+
+    def worker():
+        try:
+            with OT(sess()["ip"], sess()["port"], uid) as o:
+                fn = {"c": o.read_c, "di": o.read_di, "h": o.read_h, "ir": o.read_ir}[typ]
+                while not stop.is_set():
+                    t_req = time.perf_counter()
+                    block = fn(blk0, n)
+                    dt = time.perf_counter() - t_req
+                    if block is None:
+                        stats["err"] += 1
+                    else:
+                        stats["reads"] += 1
+                        stats["last"] = block
+                        stats["lat_sum"] += dt; stats["lat_n"] += 1
+                        if dt < stats["lat_min"]: stats["lat_min"] = dt
+                        if dt > stats["lat_max"]: stats["lat_max"] = dt
+                        sv = _flood_scalar(block, typ, dmode)
+                        if sv is not None:
+                            if stats["vmin"] is None or sv < stats["vmin"]: stats["vmin"] = sv
+                            if stats["vmax"] is None or sv > stats["vmax"]: stats["vmax"] = sv
+                    if count and (stats["reads"] + stats["err"]) >= count:
+                        stop.set(); break
+        except Exception as e:
+            vprint(f"flood-read thread: {e}")
+
+    t0 = time.time(); last_print = 0.0
+    ths = [threading.Thread(target=worker, daemon=True) for _ in range(threads)]
+    for t in ths:
+        t.start()
+    try:
+        while any(t.is_alive() for t in ths):
+            el = time.time() - t0
+            if not count and dur and el >= dur:
+                stop.set(); break
+            if el - last_print >= 0.5:
+                _flood_read_line(stats, el, typ, dmode); last_print = el
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        stop.set(); print(); info("(stopped)")
+    for t in ths:
+        t.join(timeout=1.0)
+
+    el = (time.time() - t0) or 1e-9
+    last = _flood_fmt_last(stats["last"], typ, dmode)
+    if stats["reads"] == 0 and stats["err"] == 0:
+        err(f"no reads completed - cannot reach {sess()['ip'] or '?'}:{sess()['port']} "
+            f"(check ip/port/uid, or -v for the real error)")
+        return
+    total = stats["reads"] + stats["err"]
+    errpct = (stats["err"] / total * 100.0) if total else 0.0
+    avg_ms = (stats["lat_sum"] / stats["lat_n"] * 1000.0) if stats["lat_n"] else 0.0
+    ok(f"flood read done: reads={stats['reads']} err={stats['err']} ({errpct:.1f}%) "
+       f"time={el:.2f}s rate={stats['reads']/el:.1f}/s")
+    if stats["lat_n"]:
+        print(f"  {C.DIM}latency(ms): min={stats['lat_min']*1000:.2f} "
+              f"avg={avg_ms:.2f} max={stats['lat_max']*1000:.2f}  ({threads} thread(s)){C.RS}")
+    if stats["vmin"] is not None:
+        if stats["vmin"] == stats["vmax"]:
+            print(f"  {C.DIM}value: constant {stats['vmin']} (never changed during the flood){C.RS}")
+        else:
+            print(f"  {C.DIM}value: moved {stats['vmin']} .. {stats['vmax']} during the flood{C.RS}")
+    print(f"  {C.DIM}last={last}{C.RS}")
+    record_finding("floodread",
+                   f"{typ} {span} x{stats['reads']} err={stats['err']}({errpct:.0f}%) "
+                   f"@ {stats['reads']/el:.0f}/s avglat={avg_ms:.1f}ms")
 
 
 def m_monitor(flags, args):
@@ -1263,7 +1418,7 @@ HELP = f"""
   {C.OR}S{C.RS}      current session + how to set (set ip/port/uid/slave/decode)
   {C.OR}8{C.RS}      all sessions - list, then  use [N|name]  to switch
   {C.OR}0{C.RS}      info      FC43 device id
-  {C.OR}1{C.RS}      enum      read/scan c|di|h|ir
+  {C.OR}1{C.RS}      enum      read/scan/flood c|di|h|ir
   {C.OR}2{C.RS}      monitor   poll every N s
   {C.OR}3{C.RS}      watch     delta + threshold alert
   {C.OR}4{C.RS}      write     coil/hreg (confirm)
@@ -1408,9 +1563,13 @@ MODE_HELP = {
     scan h RANGE          sweep holding regs, show non-zero only
     scan ir RANGE         sweep input regs
     scan -u 0-32          find which slave/unit ids answer
+    flood TYPE ADDR [SEC] hammer reads at MAX speed (default 10s); reports
+                         reads/s, error %, latency min/avg/max, value range seen
   ADDR: 5 | 1-20 | 1-20,100,200
   flags: -d f32|ascii|hex|time  -u N  -F (hide 0/false)  --multi (block read)  -t N (threads)  -v (verbose)
+         flood only: SEC or -D sec (0=until Ctrl-C)  --count N (stop after N reads)
   {C.DIM}ex: read h 1027 | read h 2048-2053 -d f32 | read c 1-16 -F | scan h 0-4096
+      flood h 1027 | flood h 1027 30 | flood h 1024-1030 -t 8 | flood h 40050 -d f32
       chain with | : read c 1-8 | scan h 1-50{C.RS}
   {C.OR}b{C.RS} = back to main menu""",
 
@@ -1709,11 +1868,12 @@ def handle(line):
 COMMANDS = ["help", "exit", "set", "use", "session", "info", "enum", "read",
             "monitor", "watch", "write", "persist", "rtu", "auto", "brute", "S", "8",
             "0", "1", "2", "3", "4", "5", "6", "7", "9", "00", "b", "discover", "verbose", "misc", "guide", "auth", "tag", "unlock", "lock"]
-SUB = {"enum": ["read", "scan"], "read": ["c", "di", "h", "ir"],
-       "scan": ["h", "ir", "-u"], "persist": ["fc23", "all", "--flood"],
+SUB = {"enum": ["read", "scan", "flood"], "read": ["c", "di", "h", "ir"],
+       "scan": ["h", "ir", "-u"], "flood": ["c", "di", "h", "ir"],
+       "persist": ["fc23", "all", "--flood"],
        "set": ["ip", "port", "uid", "slave", "decode"], "auto": ["recon", "writable", "slave"],
        "8": ["new", "save", "del", "export"]}
-MODE_SUB = {"enum": ["read", "scan", "c", "di", "h", "ir"],
+MODE_SUB = {"enum": ["read", "scan", "flood", "c", "di", "h", "ir"],
             "monitor": ["c", "di", "h", "ir"], "watch": ["c", "di", "h", "ir", "thr"],
             "write": ["c", "h"], "persist": ["h", "c", "fc23", "all", "--flood"],
             "auto": ["recon", "writable", "slave", "full"], "discover": [],
