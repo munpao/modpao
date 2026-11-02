@@ -481,11 +481,28 @@ def _flood_fmt_last(block, typ, dmode):
     return str(block[0] if len(block) == 1 else list(block))
 
 
+def _flood_scalar(block, typ, dmode):
+    """pull one numeric value out of a read, for value-range (min/max) tracking."""
+    if not block:
+        return None
+    if typ in ("h", "ir") and dmode == "f32":
+        try:
+            d = decode(block, "f32")
+            return d[0] if d else None
+        except Exception:
+            return None
+    v = block[0]
+    if isinstance(v, bool):
+        return int(v)
+    return v if isinstance(v, (int, float)) else None
+
+
 def _flood_read_line(stats, el, typ, dmode):
     el = el or 1e-9
     last = _flood_fmt_last(stats["last"], typ, dmode)
+    avg_ms = (stats["lat_sum"] / stats["lat_n"] * 1000.0) if stats["lat_n"] else 0.0
     print(f"  {C.DIM}reads={stats['reads']:<7} err={stats['err']:<5} "
-          f"rate={stats['reads']/el:7.1f}/s  last={last}{C.RS}")
+          f"rate={stats['reads']/el:7.1f}/s  lat~{avg_ms:5.2f}ms  last={last}{C.RS}")
 
 
 def m_flood_read(flags, args):
@@ -494,11 +511,12 @@ def m_flood_read(flags, args):
     Different from MONITOR (paced table poll) and WATCH (delta alert): no pacing,
     it hammers reads at max speed. The read-side twin of persist --flood."""
     if len(args) < 2:
-        info("FLOOD read - hammer the same address(es) at max speed, live rate/err stats")
+        info("FLOOD read - hammer the same address(es) at max speed, live rate/latency stats")
         print("    flood TYPE ADDR [SECONDS]    TYPE = c|di|h|ir   (ADDR = 5 or range 1-10)")
         print(f"  {C.DIM}how long: SECONDS as a word, or -D sec  (default 10s, 0 = until Ctrl-C)")
         print("  flags: --count N (stop after N reads)  -t N (threads)  -d f32|ascii|hex  -u uid")
-        print(f"  ex: flood h 1027 | flood h 1027 30 | flood h 1024-1030 -t 8 | flood c 1 -D 0{C.RS}")
+        print("  reports: reads/s, error %, latency min/avg/max (ms), value range seen")
+        print(f"  ex: flood h 1027 | flood h 1027 30 | flood h 1024-1030 -t 8 | flood h 40050 -d f32{C.RS}")
         return
     typ = args[0]
     if typ not in TYPE_NAME:
@@ -532,19 +550,30 @@ def m_flood_read(flags, args):
     print(f"  {C.DIM}Ctrl-C to stop early{C.RS}")
 
     stop = threading.Event()
-    stats = {"reads": 0, "err": 0, "last": None}
+    stats = {"reads": 0, "err": 0, "last": None,
+             "lat_sum": 0.0, "lat_n": 0, "lat_min": float("inf"), "lat_max": 0.0,
+             "vmin": None, "vmax": None}
 
     def worker():
         try:
             with OT(sess()["ip"], sess()["port"], uid) as o:
                 fn = {"c": o.read_c, "di": o.read_di, "h": o.read_h, "ir": o.read_ir}[typ]
                 while not stop.is_set():
+                    t_req = time.perf_counter()
                     block = fn(blk0, n)
+                    dt = time.perf_counter() - t_req
                     if block is None:
                         stats["err"] += 1
                     else:
                         stats["reads"] += 1
                         stats["last"] = block
+                        stats["lat_sum"] += dt; stats["lat_n"] += 1
+                        if dt < stats["lat_min"]: stats["lat_min"] = dt
+                        if dt > stats["lat_max"]: stats["lat_max"] = dt
+                        sv = _flood_scalar(block, typ, dmode)
+                        if sv is not None:
+                            if stats["vmin"] is None or sv < stats["vmin"]: stats["vmin"] = sv
+                            if stats["vmax"] is None or sv > stats["vmax"]: stats["vmax"] = sv
                     if count and (stats["reads"] + stats["err"]) >= count:
                         stop.set(); break
         except Exception as e:
@@ -573,10 +602,23 @@ def m_flood_read(flags, args):
         err(f"no reads completed - cannot reach {sess()['ip'] or '?'}:{sess()['port']} "
             f"(check ip/port/uid, or -v for the real error)")
         return
-    ok(f"flood read done: reads={stats['reads']} err={stats['err']} "
-       f"time={el:.2f}s rate={stats['reads']/el:.1f}/s last={last}")
+    total = stats["reads"] + stats["err"]
+    errpct = (stats["err"] / total * 100.0) if total else 0.0
+    avg_ms = (stats["lat_sum"] / stats["lat_n"] * 1000.0) if stats["lat_n"] else 0.0
+    ok(f"flood read done: reads={stats['reads']} err={stats['err']} ({errpct:.1f}%) "
+       f"time={el:.2f}s rate={stats['reads']/el:.1f}/s")
+    if stats["lat_n"]:
+        print(f"  {C.DIM}latency(ms): min={stats['lat_min']*1000:.2f} "
+              f"avg={avg_ms:.2f} max={stats['lat_max']*1000:.2f}  ({threads} thread(s)){C.RS}")
+    if stats["vmin"] is not None:
+        if stats["vmin"] == stats["vmax"]:
+            print(f"  {C.DIM}value: constant {stats['vmin']} (never changed during the flood){C.RS}")
+        else:
+            print(f"  {C.DIM}value: moved {stats['vmin']} .. {stats['vmax']} during the flood{C.RS}")
+    print(f"  {C.DIM}last={last}{C.RS}")
     record_finding("floodread",
-                   f"{typ} {span} x{stats['reads']} err={stats['err']} @ {stats['reads']/el:.0f}/s")
+                   f"{typ} {span} x{stats['reads']} err={stats['err']}({errpct:.0f}%) "
+                   f"@ {stats['reads']/el:.0f}/s avglat={avg_ms:.1f}ms")
 
 
 def m_monitor(flags, args):
@@ -1521,12 +1563,13 @@ MODE_HELP = {
     scan h RANGE          sweep holding regs, show non-zero only
     scan ir RANGE         sweep input regs
     scan -u 0-32          find which slave/unit ids answer
-    flood TYPE ADDR [SEC] hammer reads at MAX speed, live rate/err (default 10s)
+    flood TYPE ADDR [SEC] hammer reads at MAX speed (default 10s); reports
+                         reads/s, error %, latency min/avg/max, value range seen
   ADDR: 5 | 1-20 | 1-20,100,200
   flags: -d f32|ascii|hex|time  -u N  -F (hide 0/false)  --multi (block read)  -t N (threads)  -v (verbose)
          flood only: SEC or -D sec (0=until Ctrl-C)  --count N (stop after N reads)
   {C.DIM}ex: read h 1027 | read h 2048-2053 -d f32 | read c 1-16 -F | scan h 0-4096
-      flood h 1027 | flood h 1027 30 | flood h 1024-1030 -t 8 | flood c 1 -D 0
+      flood h 1027 | flood h 1027 30 | flood h 1024-1030 -t 8 | flood h 40050 -d f32
       chain with | : read c 1-8 | scan h 1-50{C.RS}
   {C.OR}b{C.RS} = back to main menu""",
 

@@ -32,7 +32,7 @@ By using modpao you agree that you are solely responsible for your actions. See 
 
 - **Interactive console** with modes you enter by number (`1` = enum, `4` = write, ...), per-mode `help`, and `b` to go back.
 - **Read / scan** coils, discrete inputs, holding & input registers — block reads, threads, decode (`f32`, `ascii`, `hex`, `int`, `time`), zero-filter.
-- **Flood read** — hammer the same address(es) at max speed with live rate/error stats (throughput / stress / liveness test; the read-side twin of `persist --flood`).
+- **Flood read** — hammer the same address(es) at max speed and report throughput (reads/s), error %, latency (min/avg/max), and the value range seen (throughput / stress / liveness test; the read-side twin of `persist --flood`).
 - **recon** — one-shot device recon and a **full sweep** of all types (0-65535) with auto-chunking, **early-stop**, and optional threading.
 - **Write** coils / registers via FC05/06 (single), FC15/16 (multi/block), or **FC23** (read+write, bypasses firewalls that blacklist FC6/16).
 - **Authentication** for password-locked PLCs, three schemes:
@@ -107,7 +107,7 @@ b
 
 Chain commands with `|`:  `read c 1-8 | scan h 1-50`
 
-**flood read** hammers the *same* address(es) over and over as fast as it can and prints a live `reads / err / rate` line — handy as a throughput benchmark, a liveness probe, or a read-side stress test. Unlike **monitor** (paced table poll) and **watch** (change/threshold alert), it does no pacing. Duration is `10s` by default; give seconds as a word (`flood h 1027 30`), via `-D sec`, or `-D 0` / `--count N` to control how long it runs.
+**flood read** hammers the *same* address(es) over and over as fast as it can and prints a live `reads / err / rate / latency` line, then a summary with **reads/s, error %, latency min/avg/max (ms)**, and the **value range** seen during the run (so you can tell if the value was moving or pinned). Handy as a throughput benchmark, a liveness probe, or a read-side stress test. Unlike **monitor** (paced table poll) and **watch** (change/threshold alert), it does no pacing. Duration is `10s` by default; give seconds as a word (`flood h 1027 30`), via `-D sec`, or `-D 0` / `--count N` to control how long it runs. Add `-d f32` to decode register pairs (e.g. `flood h 40050 -d f32`).
 
 ### Recon (mode `7` auto)
 
